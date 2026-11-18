@@ -1,0 +1,19 @@
+$ python evals/run_evals.py http://trip-buddy-dev-1066271752.us-east-1.elb.amazonaws.com
+  (2026-11-18, live ECS Fargate deployment in us-east-1, model openai.gpt-oss-120b on Amazon Bedrock)
+
+PASS goa-fits-budget  (5.6s)
+PASS hampi-odd-group  (2.8s)
+PASS manali-over-budget  (3.3s)
+PASS list-places  (3.6s)
+PASS monsoon-warning  (2.5s)
+PASS a2a-local-guide  (6.8s)
+
+6/6 passed (100%); p50 latency 3.6s, max 6.8s
+
+$ curl http://trip-buddy-dev-1066271752.us-east-1.elb.amazonaws.com/health/deep
+{"status":"ok","checks":{"mcp":true,"guide":true},"provider":"openai","model":"openai.gpt-oss-120b","sessions":"dynamodb"}
+
+# Same evals on the full stack in local Docker before the deploy:
+6/6 passed (100%); p50 latency 4.0s, max 4.9s
+
+# The stack was then deleted (scripts/destroy.sh) to stop costs.

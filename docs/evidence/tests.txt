@@ -1,0 +1,28 @@
+$ pytest -v   (2026-11-18 19:45 UTC, Python 3.11.9)
+============================= test session starts =============================
+platform win32 -- Python 3.11.9, pytest-9.2.0, pluggy-1.7.0 -- C:\Users\visha\Downloads\final_lastday_dump_ofbootcamp_scaler\trip_buddy_aws\.venv\Scripts\python.exe
+rootdir: C:\Users\visha\Downloads\final_lastday_dump_ofbootcamp_scaler\trip_buddy_aws
+configfile: pyproject.toml
+plugins: anyio-4.16.0, langsmith-0.15.0
+collecting ... collected 12 items
+
+tests/test_integration.py::test_mcp_tools_resources_and_cost PASSED      [  8%]
+tests/test_integration.py::test_guide_agent_card PASSED                  [ 16%]
+tests/test_integration.py::test_react_loop_over_mcp_and_a2a PASSED       [ 25%]
+tests/test_unit.py::test_goa_four_friends_three_nights PASSED            [ 33%]
+tests/test_unit.py::test_odd_group_rounds_rooms_up PASSED                [ 41%]
+tests/test_unit.py::test_rejects_zero_people PASSED                      [ 50%]
+tests/test_unit.py::test_lookup_by_id_and_name PASSED                    [ 58%]
+tests/test_unit.py::test_list_summary_sorted_by_type PASSED              [ 66%]
+tests/test_unit.py::test_rag_finds_the_hills_tip PASSED                  [ 75%]
+tests/test_unit.py::test_rag_context_is_bullets PASSED                   [ 83%]
+tests/test_unit.py::test_session_memory_is_trimmed PASSED                [ 91%]
+tests/test_unit.py::test_local_embeddings_rank_the_right_tips PASSED     [100%]
+
+============================= 12 passed in 15.15s =============================
+
+$ ruff check .
+All checks passed!
+
+$ cfn-lint infra/*.yaml
+no findings

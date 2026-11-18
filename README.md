@@ -16,7 +16,7 @@ flowchart LR
   ALB --> API[trip_buddy<br/>FastAPI + ReAct agent]
   API -->|MCP / HTTP :8001| MCP[mcp_server<br/>tools + resources]
   API -->|A2A / JSON-RPC :9999| G[guide_agent<br/>Local Guide]
-  API -->|Converse + Titan embeddings| BR[(Amazon Bedrock)]
+  API -->|OpenAI-compatible API or Converse| BR[(Amazon Bedrock)]
   G --> BR
   MCP --> DDB1[(DynamoDB<br/>destinations)]
   API --> DDB2[(DynamoDB<br/>sessions, TTL)]
@@ -30,20 +30,16 @@ flowchart LR
 
 ## Evidence: it ran on AWS
 
-The demo stack is torn down between sessions to save cost. This is what it looked like live on ECS Fargate in `us-east-1`:
+The stack was deployed to ECS Fargate in `us-east-1`, tested live, and then deleted to stop costs. Redeploy it with `scripts/deploy.sh`.
 
-| Live app: budget check + MCP tools + A2A guide | Monsoon warning from RAG |
-|---|---|
-| ![Goa answer](docs/evidence/01-goa-budget-and-local-guide.png) | ![Manali in July](docs/evidence/02-manali-monsoon-warning.png) |
+![Trip Buddy answering live on AWS](docs/evidence/live-app-on-aws.webp)
 
-The chips under each answer show the agent's trajectory: `mcp: db_lookup`, `mcp: compute_trip_cost`, `a2a: ask_local_guide`, the RAG tips retrieved, and the latency.
+*Above: the app served from the ALB (`trip-buddy-dev-….elb.amazonaws.com`). The chips under the answer show the agent's trajectory: `mcp: db_lookup`, `mcp: compute_trip_cost`, the RAG tips retrieved, and the latency. The price comes from the MCP tool (₹11,800), not from the model's own arithmetic. This screenshot predates the change that renders markdown in the chat UI.*
 
-- [docs/evidence/evals-live.json](docs/evidence/evals-live.json): the 6 golden evals against the live URL, with every answer, tool call and latency
-- [docs/evidence/aws-deployment.md](docs/evidence/aws-deployment.md): AWS CLI snapshot of the stack, the ECS services, Cloud Map DNS, DynamoDB, SSM, alarms, the custom latency metric and structured logs
-- [docs/evidence/tests.txt](docs/evidence/tests.txt): the local test run
-- [Hampi, odd-sized group](docs/evidence/03-hampi-odd-group.png) · [deep health check](docs/evidence/04-health-deep.png)
+- [docs/evidence/evals-live.txt](docs/evidence/evals-live.txt): **6/6 golden evals passed against the live URL** (p50 3.6s), plus the `/health/deep` response showing MCP, A2A and DynamoDB wired up on AWS
+- [docs/evidence/tests.txt](docs/evidence/tests.txt): 12 tests, ruff and cfn-lint, all passing
 
-To reproduce, deploy and then run:
+On the next deploy, these scripts capture a fuller evidence set (screenshots, a JSON eval report and an AWS CLI snapshot with the account ID redacted):
 
 ```bash
 python evals/run_evals.py <url> --report docs/evidence/evals-live.json
