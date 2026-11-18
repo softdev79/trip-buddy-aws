@@ -1,0 +1,32 @@
+name: Destroy AWS environment
+
+on:
+  workflow_dispatch:
+    inputs:
+      env_name:
+        description: Environment to delete (stack trip-buddy-<env>)
+        default: dev
+        required: true
+      confirm:
+        description: Type the environment name again to confirm
+        required: true
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  destroy:
+    if: inputs.confirm == inputs.env_name
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.env_name }}
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+      ENV_NAME: ${{ inputs.env_name }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - run: bash scripts/destroy.sh

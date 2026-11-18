@@ -1,0 +1,26 @@
+# Local copy of the AWS topology: 3 containers on a private network, only trip_buddy published.
+# Usage:  cp .env.example .env  (add a key)  then  docker compose up --build  ->  http://localhost:8000
+services:
+  mcp:
+    build: { context: ., dockerfile: services/mcp_server/Dockerfile }
+    env_file: .env
+    environment:
+      DESTINATIONS_TABLE: ""          # in-memory data locally; DynamoDB on AWS
+
+  guide:
+    build: { context: ., dockerfile: services/guide_agent/Dockerfile }
+    env_file: .env
+    environment:
+      GUIDE_PUBLIC_URL: http://guide:9999
+
+  trip_buddy:
+    build: { context: ., dockerfile: services/trip_buddy/Dockerfile }
+    env_file: .env
+    environment:
+      MCP_URL: http://mcp:8001/mcp
+      GUIDE_URL: http://guide:9999
+      SESSIONS_TABLE: ""
+    ports: ["8000:8000"]
+    depends_on:
+      mcp: { condition: service_healthy }
+      guide: { condition: service_healthy }

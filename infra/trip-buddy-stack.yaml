@@ -1,0 +1,547 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Trip Buddy multi-agent planner. Three ECS Fargate services: the public Trip Buddy API
+  (behind an ALB), an MCP tool server and a Local Guide A2A agent (both private, found
+  through Cloud Map DNS). DynamoDB for destinations and chat sessions, Bedrock for the LLM,
+  CloudWatch alarms and a dashboard. Delete the stack to remove everything it created.
+
+Parameters:
+  EnvName:
+    Type: String
+    Default: dev
+    AllowedPattern: "^[a-z0-9-]{1,10}$"
+    Description: Environment name used in every resource name (dev, prod, demo-2 ...)
+  ImageRepoPrefix:
+    Type: String
+    Description: ECR prefix without the service suffix, e.g. 123456789012.dkr.ecr.us-east-1.amazonaws.com/trip-buddy
+  ImageTag:
+    Type: String
+    Description: Image tag to deploy (the git commit SHA in CI)
+  LlmProvider:
+    Type: String
+    Default: bedrock
+    AllowedValues: [bedrock, openai]
+  BedrockModelId:
+    Type: String
+    Default: us.amazon.nova-lite-v1:0
+    Description: Chat model or inference profile id (must support tool use through the Converse API)
+  BedrockEmbedModelId:
+    Type: String
+    Default: amazon.titan-embed-text-v2:0
+  OpenAIKeyParameterName:
+    Type: String
+    Default: /trip-buddy/openai-api-key
+    Description: SSM SecureString with the API key (only read when LlmProvider=openai)
+  OpenAIBaseUrl:
+    Type: String
+    Default: ""
+    Description: OpenAI-compatible endpoint, e.g. Bedrock Mantle. Empty = api.openai.com
+  OpenAIProjectId:
+    Type: String
+    Default: ""
+    Description: Optional project id sent as the OpenAI-Project header
+  OpenAIModel:
+    Type: String
+    Default: openai.gpt-oss-120b
+    Description: Chat model name on the OpenAI-compatible endpoint (must support tool calling)
+  EmbeddingsProvider:
+    Type: String
+    Default: ""
+    AllowedValues: ["", bedrock, openai, local]
+    Description: Empty = same as LlmProvider. 'local' needs no embeddings API.
+  DesiredCount:
+    Type: Number
+    Default: 1
+    MinValue: 0
+    MaxValue: 4
+    Description: Tasks per service. Set to 0 to stop paying for compute but keep the stack.
+  AlarmEmail:
+    Type: String
+    Default: ""
+    Description: Optional email for alarm notifications (confirm the SNS subscription mail)
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+
+Conditions:
+  UseOpenAI: !Equals [!Ref LlmProvider, openai]
+  HasAlarmEmail: !Not [!Equals [!Ref AlarmEmail, ""]]
+  HasEmbeddingsProvider: !Not [!Equals [!Ref EmbeddingsProvider, ""]]
+
+Resources:
+  # ===================================================================== network
+  # Two public subnets (the ALB needs two AZs). No NAT gateway, to keep the bill small:
+  # tasks get a public IP for outbound calls (ECR, Bedrock) and security groups block
+  # every inbound path except ALB -> API -> MCP / Guide.
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.20.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags: [{ Key: Name, Value: !Sub "trip-buddy-${EnvName}" }]
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties: { VpcId: !Ref Vpc, InternetGatewayId: !Ref InternetGateway }
+  SubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.20.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Name, Value: !Sub "trip-buddy-${EnvName}-a" }]
+  SubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.20.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Name, Value: !Sub "trip-buddy-${EnvName}-b" }]
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties: { VpcId: !Ref Vpc }
+  DefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachment
+    Properties: { RouteTableId: !Ref RouteTable, DestinationCidrBlock: 0.0.0.0/0, GatewayId: !Ref InternetGateway }
+  SubnetARoutes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref SubnetA, RouteTableId: !Ref RouteTable }
+  SubnetBRoutes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref SubnetB, RouteTableId: !Ref RouteTable }
+
+  # ===================================================================== security groups
+  # internet -> ALB:80 -> trip_buddy:8000 -> mcp:8001 / guide:9999
+  AlbSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Public HTTP into the load balancer
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0 }
+  ApiSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Trip Buddy API, reachable only from the ALB
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 8000, ToPort: 8000, SourceSecurityGroupId: !Ref AlbSg }
+  BackendSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: MCP server and Guide agent, reachable only from the API
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 8001, ToPort: 8001, SourceSecurityGroupId: !Ref ApiSg }
+        - { IpProtocol: tcp, FromPort: 9999, ToPort: 9999, SourceSecurityGroupId: !Ref ApiSg }
+
+  # ===================================================================== data
+  DestinationsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "trip-buddy-${EnvName}-destinations"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions: [{ AttributeName: place_id, AttributeType: S }]
+      KeySchema: [{ AttributeName: place_id, KeyType: HASH }]
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+  SessionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "trip-buddy-${EnvName}-sessions"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions: [{ AttributeName: session_id, AttributeType: S }]
+      KeySchema: [{ AttributeName: session_id, KeyType: HASH }]
+      TimeToLiveSpecification: { AttributeName: expires_at, Enabled: true }
+
+  # ===================================================================== ECS + discovery + logs
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "trip-buddy-${EnvName}"
+      CapacityProviders: [FARGATE, FARGATE_SPOT]
+  Namespace:
+    Type: AWS::ServiceDiscovery::PrivateDnsNamespace
+    Properties:
+      Name: !Sub "trip-buddy-${EnvName}.local"
+      Vpc: !Ref Vpc
+  McpDiscovery:
+    Type: AWS::ServiceDiscovery::Service
+    Properties:
+      Name: mcp
+      NamespaceId: !Ref Namespace
+      DnsConfig: { RoutingPolicy: MULTIVALUE, DnsRecords: [{ Type: A, TTL: 10 }] }
+      HealthCheckCustomConfig: { FailureThreshold: 1 }
+  GuideDiscovery:
+    Type: AWS::ServiceDiscovery::Service
+    Properties:
+      Name: guide
+      NamespaceId: !Ref Namespace
+      DnsConfig: { RoutingPolicy: MULTIVALUE, DnsRecords: [{ Type: A, TTL: 10 }] }
+      HealthCheckCustomConfig: { FailureThreshold: 1 }
+  ApiLogs:
+    Type: AWS::Logs::LogGroup
+    Properties: { LogGroupName: !Sub "/ecs/trip-buddy-${EnvName}/trip_buddy", RetentionInDays: !Ref LogRetentionDays }
+  McpLogs:
+    Type: AWS::Logs::LogGroup
+    Properties: { LogGroupName: !Sub "/ecs/trip-buddy-${EnvName}/mcp_server", RetentionInDays: !Ref LogRetentionDays }
+  GuideLogs:
+    Type: AWS::Logs::LogGroup
+    Properties: { LogGroupName: !Sub "/ecs/trip-buddy-${EnvName}/guide_agent", RetentionInDays: !Ref LogRetentionDays }
+
+  # ===================================================================== IAM (one role per service, least privilege)
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement: [{ Effect: Allow, Principal: { Service: ecs-tasks.amazonaws.com }, Action: sts:AssumeRole }]
+      ManagedPolicyArns: [!Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"]
+      Policies:
+        - !If
+          - UseOpenAI
+          - PolicyName: ReadOpenAIKey
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Action: ssm:GetParameters
+                  Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${OpenAIKeyParameterName}"
+          - !Ref AWS::NoValue
+
+  McpTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement: [{ Effect: Allow, Principal: { Service: ecs-tasks.amazonaws.com }, Action: sts:AssumeRole }]
+      Policies:
+        - PolicyName: DestinationsTable
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:Scan, dynamodb:BatchWriteItem, dynamodb:PutItem]
+                Resource: !GetAtt DestinationsTable.Arn
+
+  GuideTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement: [{ Effect: Allow, Principal: { Service: ecs-tasks.amazonaws.com }, Action: sts:AssumeRole }]
+      Policies:
+        - PolicyName: InvokeBedrock
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [bedrock:InvokeModel, bedrock:InvokeModelWithResponseStream]
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:bedrock:*::foundation-model/*"
+                  - !Sub "arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:inference-profile/*"
+
+  ApiTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement: [{ Effect: Allow, Principal: { Service: ecs-tasks.amazonaws.com }, Action: sts:AssumeRole }]
+      Policies:
+        - PolicyName: InvokeBedrockAndSessions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [bedrock:InvokeModel, bedrock:InvokeModelWithResponseStream]
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:bedrock:*::foundation-model/*"
+                  - !Sub "arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:inference-profile/*"
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:DeleteItem]
+                Resource: !GetAtt SessionsTable.Arn
+
+  # ===================================================================== task definitions
+  McpTask:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "trip-buddy-${EnvName}-mcp"
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: "256"
+      Memory: "512"
+      RuntimePlatform: { CpuArchitecture: X86_64, OperatingSystemFamily: LINUX }
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      TaskRoleArn: !GetAtt McpTaskRole.Arn
+      ContainerDefinitions:
+        - Name: mcp_server
+          Image: !Sub "${ImageRepoPrefix}-mcp_server:${ImageTag}"
+          PortMappings: [{ ContainerPort: 8001 }]
+          Environment:
+            - { Name: DESTINATIONS_TABLE, Value: !Ref DestinationsTable }
+            - { Name: AWS_REGION, Value: !Ref AWS::Region }
+          LogConfiguration:
+            LogDriver: awslogs
+            Options: { awslogs-group: !Ref McpLogs, awslogs-region: !Ref AWS::Region, awslogs-stream-prefix: ecs }
+
+  GuideTask:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "trip-buddy-${EnvName}-guide"
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: "256"
+      Memory: "512"
+      RuntimePlatform: { CpuArchitecture: X86_64, OperatingSystemFamily: LINUX }
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      TaskRoleArn: !GetAtt GuideTaskRole.Arn
+      ContainerDefinitions:
+        - Name: guide_agent
+          Image: !Sub "${ImageRepoPrefix}-guide_agent:${ImageTag}"
+          PortMappings: [{ ContainerPort: 9999 }]
+          Environment:
+            - { Name: GUIDE_PUBLIC_URL, Value: !Sub "http://guide.trip-buddy-${EnvName}.local:9999" }
+            - { Name: LLM_PROVIDER, Value: !Ref LlmProvider }
+            - { Name: BEDROCK_MODEL_ID, Value: !Ref BedrockModelId }
+            - { Name: OPENAI_BASE_URL, Value: !Ref OpenAIBaseUrl }
+            - { Name: OPENAI_PROJECT_ID, Value: !Ref OpenAIProjectId }
+            - { Name: OPENAI_MODEL, Value: !Ref OpenAIModel }
+            - { Name: EMBEDDINGS_PROVIDER, Value: !If [HasEmbeddingsProvider, !Ref EmbeddingsProvider, !Ref LlmProvider] }
+            - { Name: AWS_REGION, Value: !Ref AWS::Region }
+          Secrets: !If
+            - UseOpenAI
+            - [{ Name: OPENAI_API_KEY, ValueFrom: !Ref OpenAIKeyParameterName }]
+            - !Ref AWS::NoValue
+          LogConfiguration:
+            LogDriver: awslogs
+            Options: { awslogs-group: !Ref GuideLogs, awslogs-region: !Ref AWS::Region, awslogs-stream-prefix: ecs }
+
+  ApiTask:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "trip-buddy-${EnvName}-api"
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: "512"
+      Memory: "1024"
+      RuntimePlatform: { CpuArchitecture: X86_64, OperatingSystemFamily: LINUX }
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      TaskRoleArn: !GetAtt ApiTaskRole.Arn
+      ContainerDefinitions:
+        - Name: trip_buddy
+          Image: !Sub "${ImageRepoPrefix}-trip_buddy:${ImageTag}"
+          PortMappings: [{ ContainerPort: 8000 }]
+          Environment:
+            - { Name: MCP_URL, Value: !Sub "http://mcp.trip-buddy-${EnvName}.local:8001/mcp" }
+            - { Name: GUIDE_URL, Value: !Sub "http://guide.trip-buddy-${EnvName}.local:9999" }
+            - { Name: SESSIONS_TABLE, Value: !Ref SessionsTable }
+            - { Name: LLM_PROVIDER, Value: !Ref LlmProvider }
+            - { Name: BEDROCK_MODEL_ID, Value: !Ref BedrockModelId }
+            - { Name: OPENAI_BASE_URL, Value: !Ref OpenAIBaseUrl }
+            - { Name: OPENAI_PROJECT_ID, Value: !Ref OpenAIProjectId }
+            - { Name: OPENAI_MODEL, Value: !Ref OpenAIModel }
+            - { Name: EMBEDDINGS_PROVIDER, Value: !If [HasEmbeddingsProvider, !Ref EmbeddingsProvider, !Ref LlmProvider] }
+            - { Name: BEDROCK_EMBED_MODEL_ID, Value: !Ref BedrockEmbedModelId }
+            - { Name: AWS_REGION, Value: !Ref AWS::Region }
+          Secrets: !If
+            - UseOpenAI
+            - [{ Name: OPENAI_API_KEY, ValueFrom: !Ref OpenAIKeyParameterName }]
+            - !Ref AWS::NoValue
+          LogConfiguration:
+            LogDriver: awslogs
+            Options: { awslogs-group: !Ref ApiLogs, awslogs-region: !Ref AWS::Region, awslogs-stream-prefix: ecs }
+
+  # ===================================================================== services
+  McpService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: mcp
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref McpTask
+      DesiredCount: !Ref DesiredCount
+      LaunchType: FARGATE
+      DeploymentConfiguration:
+        DeploymentCircuitBreaker: { Enable: true, Rollback: true }
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets: [!Ref SubnetA, !Ref SubnetB]
+          SecurityGroups: [!Ref BackendSg]
+      ServiceRegistries: [{ RegistryArn: !GetAtt McpDiscovery.Arn }]
+
+  GuideService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: guide
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref GuideTask
+      DesiredCount: !Ref DesiredCount
+      LaunchType: FARGATE
+      DeploymentConfiguration:
+        DeploymentCircuitBreaker: { Enable: true, Rollback: true }
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets: [!Ref SubnetA, !Ref SubnetB]
+          SecurityGroups: [!Ref BackendSg]
+      ServiceRegistries: [{ RegistryArn: !GetAtt GuideDiscovery.Arn }]
+
+  ApiService:
+    Type: AWS::ECS::Service
+    DependsOn: [Listener, McpService, GuideService]
+    Properties:
+      ServiceName: trip-buddy
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref ApiTask
+      DesiredCount: !Ref DesiredCount
+      LaunchType: FARGATE
+      HealthCheckGracePeriodSeconds: 60
+      DeploymentConfiguration:
+        DeploymentCircuitBreaker: { Enable: true, Rollback: true }
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets: [!Ref SubnetA, !Ref SubnetB]
+          SecurityGroups: [!Ref ApiSg]
+      LoadBalancers:
+        - { ContainerName: trip_buddy, ContainerPort: 8000, TargetGroupArn: !Ref TargetGroup }
+
+  # ===================================================================== load balancer
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    DependsOn: GatewayAttachment
+    Properties:
+      Name: !Sub "trip-buddy-${EnvName}"
+      Scheme: internet-facing
+      Subnets: [!Ref SubnetA, !Ref SubnetB]
+      SecurityGroups: [!Ref AlbSg]
+      LoadBalancerAttributes:
+        - { Key: idle_timeout.timeout_seconds, Value: "120" }   # agent turns can take a while
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref Vpc
+      Port: 8000
+      Protocol: HTTP
+      TargetType: ip
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 15
+      HealthyThresholdCount: 2
+      TargetGroupAttributes:
+        - { Key: deregistration_delay.timeout_seconds, Value: "15" }
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions: [{ Type: forward, TargetGroupArn: !Ref TargetGroup }]
+
+  # ===================================================================== observability
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties: { TopicName: !Sub "trip-buddy-${EnvName}-alarms" }
+  AlarmEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlarmEmail
+    Properties: { TopicArn: !Ref AlarmTopic, Protocol: email, Endpoint: !Ref AlarmEmail }
+
+  # Turns the API's JSON "chat" log lines into a custom metric: agent latency per request.
+  AgentLatencyMetric:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref ApiLogs
+      FilterPattern: '{ $.msg = "chat" }'
+      MetricTransformations:
+        - { MetricNamespace: TripBuddy, MetricName: AgentLatencyMs, MetricValue: "$.latency_ms", Unit: Milliseconds,
+            Dimensions: [{ Key: Service, Value: "$.service" }] }
+  AgentErrorMetric:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref ApiLogs
+      FilterPattern: '{ $.msg = "agent_failed" }'
+      MetricTransformations:
+        - { MetricNamespace: TripBuddy, MetricName: AgentErrors, MetricValue: "1", DefaultValue: 0 }
+
+  Alb5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "trip-buddy-${EnvName}-5xx"
+      AlarmDescription: The API returned 5 or more server errors in 5 minutes
+      Namespace: AWS/ApplicationELB
+      MetricName: HTTPCode_Target_5XX_Count
+      Dimensions: [{ Name: LoadBalancer, Value: !GetAtt LoadBalancer.LoadBalancerFullName }]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+  UnhealthyHostAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "trip-buddy-${EnvName}-unhealthy"
+      AlarmDescription: No healthy API task behind the load balancer
+      Namespace: AWS/ApplicationELB
+      MetricName: HealthyHostCount
+      Dimensions:
+        - { Name: LoadBalancer, Value: !GetAtt LoadBalancer.LoadBalancerFullName }
+        - { Name: TargetGroup, Value: !GetAtt TargetGroup.TargetGroupFullName }
+      Statistic: Minimum
+      Period: 60
+      EvaluationPeriods: 3
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+  SlowAgentAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "trip-buddy-${EnvName}-slow-agent"
+      AlarmDescription: p90 agent latency above 20 seconds for 10 minutes
+      Namespace: TripBuddy
+      MetricName: AgentLatencyMs
+      Dimensions: [{ Name: Service, Value: trip_buddy }]
+      ExtendedStatistic: p90
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 20000
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub "trip-buddy-${EnvName}"
+      DashboardBody: !Sub
+        - |
+          {"widgets":[
+            {"type":"metric","x":0,"y":0,"width":12,"height":6,"properties":{"title":"Requests and 5xx","region":"${AWS::Region}","stat":"Sum","period":60,
+              "metrics":[["AWS/ApplicationELB","RequestCount","LoadBalancer","${Lb}"],[".","HTTPCode_Target_5XX_Count",".","."]]}},
+            {"type":"metric","x":12,"y":0,"width":12,"height":6,"properties":{"title":"Agent latency (ms)","region":"${AWS::Region}","period":300,
+              "metrics":[["TripBuddy","AgentLatencyMs","Service","trip_buddy",{"stat":"p50"}],["...",{"stat":"p90"}]]}},
+            {"type":"metric","x":0,"y":6,"width":12,"height":6,"properties":{"title":"ECS CPU %","region":"${AWS::Region}","stat":"Average","period":60,
+              "metrics":[["AWS/ECS","CPUUtilization","ClusterName","${Cl}","ServiceName","trip-buddy"],["...","mcp"],["...","guide"]]}},
+            {"type":"log","x":12,"y":6,"width":12,"height":6,"properties":{"title":"Tool usage","region":"${AWS::Region}",
+              "query":"SOURCE '${McpLogGroup}' | filter msg = 'tool_call' | stats count(*) by tool","view":"bar"}}
+          ]}
+        - Lb: !GetAtt LoadBalancer.LoadBalancerFullName
+          Cl: !Ref Cluster
+          McpLogGroup: !Ref McpLogs
+
+Outputs:
+  AppUrl:
+    Description: Open this in a browser
+    Value: !Sub "http://${LoadBalancer.DNSName}"
+  ClusterName:
+    Value: !Ref Cluster
+  DashboardUrl:
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=trip-buddy-${EnvName}"
+  SessionsTableName:
+    Value: !Ref SessionsTable

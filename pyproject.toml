@@ -1,0 +1,19 @@
+[project]
+name = "trip-buddy-aws"
+version = "1.0.0"
+description = "Multi-agent trip planner (RAG + MCP + A2A) deployed on AWS ECS Fargate"
+requires-python = ">=3.11"
+
+[tool.ruff]
+line-length = 120
+extend-exclude = [".venv"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = ["E501"]   # long data rows (destinations, travel tips) read better on one line
+
+[tool.ruff.lint.isort]
+known-first-party = ["tripbuddy_shared", "destinations", "rag", "sessions", "agent"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

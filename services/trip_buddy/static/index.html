@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Trip Buddy</title>
+<style>
+  :root { --bg:#f7f7f5; --panel:#fff; --text:#1d1d1b; --muted:#6b6b66; --line:#e4e3de; --accent:#0f766e; --mcp:#2563eb; --a2a:#9333ea; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#151514; --panel:#1f1f1d; --text:#ecebe6; --muted:#9b9a94; --line:#33322f; --accent:#2dd4bf; --mcp:#60a5fa; --a2a:#c084fc; } }
+  * { box-sizing: border-box; }
+  body { margin:0; font:15px/1.5 system-ui, -apple-system, Segoe UI, sans-serif; background:var(--bg); color:var(--text); }
+  main { max-width:820px; margin:0 auto; padding:24px 16px 120px; }
+  h1 { font-size:22px; margin:0 0 4px; } .sub { color:var(--muted); margin:0 0 20px; }
+  .msg { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:12px 14px; margin:10px 0; white-space:pre-wrap; }
+  .user { border-left:3px solid var(--accent); }
+  .md { white-space:normal; }
+  .md > :first-child { margin-top:0; } .md > :last-child { margin-bottom:0; }
+  .md h1, .md h2, .md h3 { font-size:16px; margin:14px 0 6px; }
+  .md p, .md ul, .md ol { margin:6px 0; } .md ul, .md ol { padding-left:22px; }
+  .md table { border-collapse:collapse; margin:8px 0; font-size:14px; display:block; overflow-x:auto; }
+  .md th, .md td { border:1px solid var(--line); padding:4px 10px; text-align:left; }
+  .md th { background:var(--bg); }
+  .md code { font-size:13px; background:var(--bg); padding:1px 4px; border-radius:4px; }
+  .meta { margin-top:8px; font-size:12px; color:var(--muted); display:flex; flex-wrap:wrap; gap:6px; }
+  .chip { border:1px solid var(--line); border-radius:999px; padding:1px 8px; }
+  .chip.mcp { color:var(--mcp); border-color:var(--mcp); } .chip.a2a { color:var(--a2a); border-color:var(--a2a); }
+  .examples { display:flex; flex-wrap:wrap; gap:8px; margin-bottom:12px; }
+  .examples button { background:transparent; color:var(--text); border:1px solid var(--line); border-radius:8px; padding:6px 10px; cursor:pointer; font:inherit; font-size:13px; }
+  form { position:fixed; bottom:0; left:0; right:0; background:var(--bg); border-top:1px solid var(--line); padding:12px 16px; }
+  .row { max-width:820px; margin:0 auto; display:flex; gap:8px; }
+  input { flex:1; padding:10px 12px; border-radius:8px; border:1px solid var(--line); background:var(--panel); color:var(--text); font:inherit; }
+  .send { padding:10px 16px; border:0; border-radius:8px; background:var(--accent); color:#fff; font:inherit; cursor:pointer; }
+  .send:disabled { opacity:.5; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Trip Buddy</h1>
+  <p class="sub">Plans group trips from Bengaluru. Prices come from an MCP server, local tips from a second agent over A2A.</p>
+  <div class="examples" id="examples"></div>
+  <div id="log"></div>
+</main>
+<form id="f"><div class="row">
+  <input id="q" autocomplete="off" placeholder="We are 4 friends with Rs 12,000 each. Can we do Goa for 3 nights?">
+  <button class="send" id="send">Send</button>
+</div></form>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.1.6/purify.min.js"></script>
+<script>
+// Model output is untrusted: parse markdown, then sanitise before inserting. Plain text if the CDN is unreachable.
+function renderReply(el, text) {
+  if (window.marked && window.DOMPurify) {
+    el.classList.add("md");
+    el.innerHTML = DOMPurify.sanitize(marked.parse(text));
+  } else {
+    el.textContent = text;
+  }
+}
+const EXAMPLES = [
+  "list",
+  "We are 4 friends with Rs 12,000 each. Can we do Goa for 3 nights in December? What should we do there?",
+  "Is Manali a good idea in July?",
+  "How much is Hampi for 5 friends, 2 nights?",
+];
+let sessionId = null;
+try { sessionId = sessionStorage.getItem("tb_session"); } catch (e) {}
+const log = document.getElementById("log"), q = document.getElementById("q"), send = document.getElementById("send");
+
+function add(text, cls) {
+  const d = document.createElement("div"); d.className = "msg " + (cls || ""); d.textContent = text; log.appendChild(d);
+  d.scrollIntoView({ block: "end" }); return d;
+}
+function addMeta(el, data) {
+  const m = document.createElement("div"); m.className = "meta";
+  const chip = (t, c) => { const s = document.createElement("span"); s.className = "chip " + (c || ""); s.textContent = t; m.appendChild(s); };
+  data.steps.forEach(s => chip(`${s.via}: ${s.tool} · ${s.ms}ms`, s.via));
+  if (data.rag_hits.length) chip("rag: " + data.rag_hits.join(", "));
+  chip(`${data.latency_ms} ms total`);
+  el.appendChild(m);
+}
+async function ask(text) {
+  add(text, "user"); q.value = ""; send.disabled = true;
+  const pending = add("Thinking…");
+  try {
+    const r = await fetch("/api/chat", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message: text, session_id: sessionId }) });
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.detail || r.statusText);
+    sessionId = data.session_id;
+    try { sessionStorage.setItem("tb_session", sessionId); } catch (e) {}
+    renderReply(pending, data.reply); addMeta(pending, data);
+  } catch (e) { pending.textContent = "Error: " + e.message; }
+  send.disabled = false; q.focus();
+}
+EXAMPLES.forEach(t => { const b = document.createElement("button"); b.type = "button"; b.textContent = t.length > 48 ? t.slice(0, 46) + "…" : t; b.onclick = () => ask(t); document.getElementById("examples").appendChild(b); });
+document.getElementById("f").onsubmit = e => { e.preventDefault(); if (q.value.trim()) ask(q.value.trim()); };
+</script>
+</body>
+</html>

@@ -1,0 +1,4 @@
+langchain-core==1.8.3
+langchain-aws==1.9.3
+langchain-openai==1.8.2
+boto3==1.44.5

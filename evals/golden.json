@@ -1,0 +1,38 @@
+[
+  {
+    "id": "goa-fits-budget",
+    "question": "We are 4 friends with Rs 12,000 each. Can we do Goa for 3 nights?",
+    "expect_in_reply": ["11800"],
+    "expect_tools": [["db_lookup", "mcp"], ["compute_trip_cost", "mcp"]]
+  },
+  {
+    "id": "hampi-odd-group",
+    "question": "How much is Hampi per person for 5 friends, 2 nights?",
+    "expect_in_reply": ["4300"],
+    "expect_tools": [["db_lookup", "mcp"], ["compute_trip_cost", "mcp"]]
+  },
+  {
+    "id": "manali-over-budget",
+    "question": "3 friends, Rs 10,000 each, Manali for 2 nights. Can we afford it?",
+    "expect_in_reply": ["14933"],
+    "expect_tools": [["compute_trip_cost", "mcp"]]
+  },
+  {
+    "id": "list-places",
+    "question": "list all the places we can go",
+    "expect_in_reply": ["gokarna", "dandeli"],
+    "expect_tools": [["list_destinations", "mcp"]]
+  },
+  {
+    "id": "monsoon-warning",
+    "question": "Is Coorg a good idea in July?",
+    "expect_any_in_reply": ["rain", "landslide", "monsoon"],
+    "expect_rag": ["hills"]
+  },
+  {
+    "id": "a2a-local-guide",
+    "question": "What should we do in Hampi in January?",
+    "expect_any_in_reply": ["virupaksha", "matanga", "coracle"],
+    "expect_tools": [["ask_local_guide", "a2a"]]
+  }
+]

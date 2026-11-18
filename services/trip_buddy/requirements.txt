@@ -1,0 +1,7 @@
+-r ../../shared/requirements.txt
+mcp==1.30.0
+a2a-sdk[http-server]==1.3.1
+fastapi==0.164.0
+uvicorn==0.54.0
+httpx==0.28.1
+numpy==2.4.6
